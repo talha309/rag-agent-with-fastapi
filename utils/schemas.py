@@ -12,7 +12,7 @@ class UserResponse(BaseModel):
     email: EmailStr
 
     class Config:
-        from_attributes = True  # Updated to use from_attributes for Pydantic v2 compatibility
+        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
@@ -24,7 +24,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     user_id: int
-    timestamp: str  # Assuming you want to return the timestamp as a string in the response
+    timestamp: str
 
     class Config:
-        from_attributes = True  # Enable ORM mode for compatibility with SQLAlchemy
+        from_attributes = True
