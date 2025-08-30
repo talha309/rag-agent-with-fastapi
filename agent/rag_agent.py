@@ -21,21 +21,35 @@ load_dotenv()
 # Initialize FastAPI app
 app = FastAPI(title="Alexandra Hotel Virtual Assistant", description="A FastAPI-based hotel assistant with memory")
 
-# Initialize Google Generative AI model and embeddings
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+# Initialize Google Generative AI model and embeddings with error handling
+google_api_key = "AIzaSyD2dUul8Gf0zU9H_1n07DtPjZtsRT3CUg4"
+if not google_api_key:
+    print("WARNING: GOOGLE_API_KEY not found in environment variables.")
+    print("Please set GOOGLE_API_KEY in your .env file or environment variables.")
+    llm = None
+    embeddings = None
+else:
+    try:
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=google_api_key)
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
+    except Exception as e:
+        print(f"Error initializing Google AI: {e}")
+        llm = None
+        embeddings = None
 
 # Load and process hotel data
-try:
-    loader = TextLoader("./data/data.txt")
-    documents = loader.load()
-    text_splitter = CharacterTextSplitter(chunk_size=1500, chunk_overlap=50)
-    texts = text_splitter.split_documents(documents)
-    db = FAISS.from_documents(texts, embeddings)
-    retriever = db.as_retriever()
-except Exception as e:
-    print(f"Error loading hotel data: {e}")
-    retriever = None
+retriever = None
+if embeddings:
+    try:
+        loader = TextLoader("./data/data.txt")
+        documents = loader.load()
+        text_splitter = CharacterTextSplitter(chunk_size=200, chunk_overlap=50)
+        texts = text_splitter.split_documents(documents)
+        db = FAISS.from_documents(texts, embeddings)
+        retriever = db.as_retriever()
+    except Exception as e:
+        print(f"Error loading hotel data: {e}")
+        retriever = None
 
 # Create retriever tool
 info_retriever = create_retriever_tool(
@@ -47,7 +61,7 @@ info_retriever = create_retriever_tool(
 tools = [info_retriever] if info_retriever else []
 
 # Bind tools to LLM
-llm_with_tools = llm.bind_tools(tools) if tools else llm
+llm_with_tools = llm.bind_tools(tools) if tools and llm else llm
 
 # System messages
 HOTEL_SYSTEM_MESSAGE = (
@@ -131,6 +145,9 @@ def call_model(state: MessagesState, config: RunnableConfig):
     user_id = config["configurable"]["user_id"]
     existing_memory = retrieve_memory(user_id)
     
+    if not llm:
+        return {"messages": [SystemMessage(content="Sorry, the AI service is currently unavailable. Please check your Google API key configuration.")]}
+    
     # Combine system messages
     system_msg = f"{HOTEL_SYSTEM_MESSAGE}\n\n{MEMORY_SYSTEM_MESSAGE.format(memory=existing_memory)}"
     
@@ -145,41 +162,61 @@ def write_memory(state: MessagesState, config: RunnableConfig):
     user_id = config["configurable"]["user_id"]
     existing_memory = retrieve_memory(user_id)
     
+    if not llm:
+        return {"messages": state["messages"]}
+    
     system_msg = CREATE_MEMORY_INSTRUCTION.format(memory=existing_memory)
     new_memory_response = llm.invoke([SystemMessage(content=system_msg)] + state['messages'])
     
     save_memory(user_id, new_memory_response.content)
     return {"messages": state["messages"]}
 
-# Define StateGraph
-builder = StateGraph(MessagesState)
-builder.add_node("assistant", call_model)
-if tools:
-    builder.add_node("tools", ToolNode(tools))
-builder.add_node("write_memory", write_memory)
+# Define StateGraph only if LLM is available
+if llm:
+    builder = StateGraph(MessagesState)
+    builder.add_node("assistant", call_model)
+    if tools:
+        builder.add_node("tools", ToolNode(tools))
+    builder.add_node("write_memory", write_memory)
 
-# Define edges
-builder.add_edge(START, "assistant")
-if tools:
-    builder.add_conditional_edges("assistant", tools_condition)
-    builder.add_edge("tools", "assistant")
-builder.add_edge("assistant", "write_memory")
-builder.add_edge("write_memory", END)
+    # Define edges
+    builder.add_edge(START, "assistant")
+    if tools:
+        builder.add_conditional_edges("assistant", tools_condition)
+        builder.add_edge("tools", "assistant")
+    builder.add_edge("assistant", "write_memory")
+    builder.add_edge("write_memory", END)
 
-# Compile graph with memory
-memory = MemorySaver()
-agent = builder.compile(checkpointer=memory)
+    # Compile graph with memory
+    memory = MemorySaver()
+    agent = builder.compile(checkpointer=memory)
+else:
+    agent = None
 
 # FastAPI endpoint
 @app.get("/chat/{user_id}/{query}")
 async def get_content(user_id: str, query: str):
     """Handles chat queries with user-specific memory."""
+    if not agent:
+        return {"error": "AI service is not available. Please check your Google API key configuration."}
+    
     try:
         config = {"configurable": {"thread_id": user_id, "user_id": user_id}}
         result = agent.invoke({"messages": [HumanMessage(content=query)]}, config)
         return {"response": result["messages"][-1].content}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/")
+async def root():
+    """Root endpoint with status information."""
+    status = {
+        "status": "running",
+        "ai_service": "available" if llm else "unavailable - missing GOOGLE_API_KEY",
+        "vector_store": "available" if retriever else "unavailable",
+        "message": "Alexandra Hotel Virtual Assistant API is running"
+    }
+    return status
 
 # Main loop for testing
 if __name__ == "__main__":
