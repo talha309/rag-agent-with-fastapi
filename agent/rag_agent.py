@@ -22,7 +22,7 @@ load_dotenv()
 app = FastAPI(title="Alexandra Hotel Virtual Assistant", description="A FastAPI-based hotel assistant with memory")
 
 # Initialize Google Generative AI model and embeddings with error handling
-google_api_key = "AIzaSyD2dUul8Gf0zU9H_1n07DtPjZtsRT3CUg4"
+google_api_key = os.getenv("GEMINI_API_KEY")
 if not google_api_key:
     print("WARNING: GOOGLE_API_KEY not found in environment variables.")
     print("Please set GOOGLE_API_KEY in your .env file or environment variables.")
