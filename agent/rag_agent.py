@@ -1,77 +1,93 @@
 import os
 import sqlite3
 from fastapi import FastAPI
-from langchain_community.document_loaders import TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_text_splitters import CharacterTextSplitter
-from langchain.tools.retriever import create_retriever_tool
-from langchain import hub
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda
+from langgraph.graph.message import AnyMessage, add_messages
+from langchain_core.messages import ToolMessage, SystemMessage, HumanMessage
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import START, StateGraph, END
-from langgraph.prebuilt import tools_condition, ToolNode
-from langgraph.graph import MessagesState
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.runnables.config import RunnableConfig
+from typing import Annotated
+from typing_extensions import TypedDict
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 # Initialize FastAPI app
-app = FastAPI(title="Alexandra Hotel Virtual Assistant", description="A FastAPI-based hotel assistant with memory")
+app = FastAPI(title="Solar Panel Virtual Assistant", description="A FastAPI-based solar panel assistant with memory")
 
-# Initialize Google Generative AI model and embeddings with error handling
-google_api_key = os.getenv("GEMINI_API_KEY")
+# Initialize Google Generative AI model
+google_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+tavily_api_key = os.getenv("TAVILY_API_KEY")
+
 if not google_api_key:
     print("WARNING: GOOGLE_API_KEY not found in environment variables.")
-    print("Please set GOOGLE_API_KEY in your .env file or environment variables.")
     llm = None
-    embeddings = None
 else:
     try:
         llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=google_api_key)
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
     except Exception as e:
         print(f"Error initializing Google AI: {e}")
         llm = None
-        embeddings = None
 
-# Load and process hotel data
-retriever = None
-if embeddings:
-    try:
-        loader = TextLoader("./data/data.txt")
-        documents = loader.load()
-        text_splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        texts = text_splitter.split_documents(documents)
-        db = FAISS.from_documents(texts, embeddings)
-        retriever = db.as_retriever()
-    except Exception as e:
-        print(f"Error loading hotel data: {e}")
-        retriever = None
+if not tavily_api_key:
+    print("WARNING: TAVILY_API_KEY not found in environment variables.")
 
-# Create retriever tool
-info_retriever = create_retriever_tool(
-    retriever,
-    "hotel_information_sender",
-    "Searches information about hotel from provided vector and returns accurate details"
-) if retriever else None
+# Define compute_savings tool
+def compute_savings(monthly_cost: float) -> dict:
+    """
+    Tool to compute the potential savings when switching to solar energy based on the user's monthly electricity cost.
 
-tools = [info_retriever] if info_retriever else []
+    Args:
+        monthly_cost (float): The user's current monthly electricity cost.
+
+    Returns:
+        dict: A dictionary containing:
+            - 'number_of_panels': The estimated number of solar panels required.
+            - 'installation_cost': The estimated installation cost.
+            - 'net_savings_10_years': The net savings over 10 years after installation costs.
+    """
+    cost_per_kWh = 0.28
+    cost_per_watt = 1.50
+    sunlight_hours_per_day = 3.5
+    panel_wattage = 350
+    system_lifetime_years = 10
+
+    monthly_consumption_kWh = monthly_cost / cost_per_kWh
+    daily_energy_production = monthly_consumption_kWh / 30
+    system_size_kW = daily_energy_production / sunlight_hours_per_day
+    number_of_panels = system_size_kW * 1000 / panel_wattage
+    installation_cost = system_size_kW * 1000 * cost_per_watt
+    annual_savings = monthly_cost * 12
+    total_savings_10_years = annual_savings * system_lifetime_years
+    net_savings = total_savings_10_years - installation_cost
+
+    return {
+        "number_of_panels": round(number_of_panels),
+        "installation_cost": round(installation_cost, 2),
+        "net_savings_10_years": round(net_savings, 2)
+    }
+
+# Define tools
+tools = []
+if tavily_api_key:
+    tools.append(TavilySearchResults(tavily_api_key=tavily_api_key))
 
 # Bind tools to LLM
 llm_with_tools = llm.bind_tools(tools) if tools and llm else llm
 
-# System messages
-HOTEL_SYSTEM_MESSAGE = (
-    "You are the Alexandra Hotel's virtual assistant, harnessing the power of artificial intelligence to transform guest experiences. "
-    "As an AI-driven assistant, you excel at processing vast datasets to deliver accurate, personalized, and efficient responses to customer queries. "
-    "You have access to a specialized tool that retrieves up-to-date information about hotel amenities, room availability, pricing, dining options, events, and policies. "
-    "Use this tool to provide precise, data-driven answers that enhance guest satisfaction. "
-    "Reflecting AI's transformative potential, as seen in industries like healthcare and transportation, your responses should be tailored to individual needs while maintaining fairness and transparency to avoid biases. "
-    "For queries requiring external actions, such as booking confirmations or cancellations, politely guide users to contact the hotel's staff. "
-    "Adopt a professional yet approachable tone, ensuring guests feel valued while showcasing AI's ability to streamline and personalize customer service."
+# System prompt for solar panel assistant
+SOLAR_SYSTEM_MESSAGE = (
+    "You are a helpful customer support assistant specializing in Solar Panels. "
+    "Your role is to provide users with accurate information about solar panels and how they work by utilizing the Tavily search tool for web searches. "
+    "For any questions about solar systems, provide to-the-point answers based on search results. "
+    "When users inquire about savings, ask for their current monthly electricity cost. "
+    "If the user's message doesn't include this information or it's unclear, kindly request clarification. Avoid making assumptions. "
+    "Once you've gathered the necessary details, call the appropriate tool to assist the user."
 )
 
 MEMORY_SYSTEM_MESSAGE = """You are a helpful assistant with memory that provides information about the user.
@@ -139,25 +155,95 @@ def retrieve_memory(user_id):
         return row[0] if row else "No existing memory found."
     return "No existing memory found."
 
-# Graph nodes
-def call_model(state: MessagesState, config: RunnableConfig):
-    """Handles the main assistant logic with memory and hotel tools."""
-    user_id = config["configurable"]["user_id"]
-    existing_memory = retrieve_memory(user_id)
-    
-    if not llm:
-        return {"messages": [SystemMessage(content="Sorry, the AI service is currently unavailable. Please check your Google API key configuration.")]}
-    
-    # Combine system messages
-    system_msg = f"{HOTEL_SYSTEM_MESSAGE}\n\n{MEMORY_SYSTEM_MESSAGE.format(memory=existing_memory)}"
-    
-    # Use last 10 messages for context
-    messages = [SystemMessage(content=system_msg)] + state["messages"][-10:]
-    response = llm_with_tools.invoke(messages)
-    
-    return {"messages": [response]}
+# Error handling for tools
+def handle_tool_error(state) -> dict:
+    """
+    Function to handle errors that occur during tool execution.
 
-def write_memory(state: MessagesState, config: RunnableConfig):
+    Args:
+        state (dict): The current state of the AI agent, which includes messages and tool call details.
+
+    Returns:
+        dict: A dictionary containing error messages for each tool that encountered an issue.
+    """
+    error = state.get("error")
+    tool_calls = state["messages"][-1].tool_calls
+    return {
+        "messages": [
+            ToolMessage(
+                content=f"Error: {repr(error)}\n please fix your mistakes.",
+                tool_call_id=tc["id"],
+            )
+            for tc in tool_calls
+        ]
+    }
+
+# Create tool node with fallback
+def create_tool_node_with_fallback(tools: list) -> dict:
+    """
+    Function to create a tool node with fallback error handling.
+
+    Args:
+        tools (list): A list of tools to be included in the node.
+
+    Returns:
+        dict: A tool node that uses fallback behavior in case of errors.
+    """
+    return ToolNode(tools).with_fallbacks(
+        [RunnableLambda(handle_tool_error)],
+        exception_key="error"
+    )
+
+# Define state
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+# Assistant class
+class Assistant:
+    def __init__(self, runnable: Runnable):
+        self.runnable = runnable
+
+    def __call__(self, state: State, config: RunnableConfig):
+        while True:
+            result = self.runnable.invoke(state)
+            if not result.tool_calls and (
+                not result.content
+                or isinstance(result.content, list)
+                and not result.content[0].get("text")
+            ):
+                messages = state["messages"] + [("user", "Respond with a real output.")]
+                state = {**state, "messages": messages}
+            else:
+                break
+        return {"messages": result}
+
+# Define StateGraph
+if llm:
+    primary_assistant_prompt = ChatPromptTemplate.from_messages([
+        ("system", f"{SOLAR_SYSTEM_MESSAGE}\n\n{MEMORY_SYSTEM_MESSAGE.format(memory='{memory}')}"),
+        ("placeholder", "{messages}"),
+    ])
+    assistant_runnable = primary_assistant_prompt | llm_with_tools
+    builder = StateGraph(State)
+    builder.add_node("assistant", Assistant(assistant_runnable))
+    if tools:
+        builder.add_node("tools", create_tool_node_with_fallback(tools))
+    builder.add_node("write_memory", write_memory)
+
+    builder.add_edge(START, "assistant")
+    if tools:
+        builder.add_conditional_edges("assistant", tools_condition)
+        builder.add_edge("tools", "assistant")
+    builder.add_edge("assistant", "write_memory")
+    builder.add_edge("write_memory", END)
+
+    memory = MemorySaver()
+    agent = builder.compile(checkpointer=memory)
+else:
+    agent = None
+
+# Write memory node
+def write_memory(state: State, config: RunnableConfig):
     """Updates and saves user memory based on chat history."""
     user_id = config["configurable"]["user_id"]
     existing_memory = retrieve_memory(user_id)
@@ -171,29 +257,7 @@ def write_memory(state: MessagesState, config: RunnableConfig):
     save_memory(user_id, new_memory_response.content)
     return {"messages": state["messages"]}
 
-# Define StateGraph only if LLM is available
-if llm:
-    builder = StateGraph(MessagesState)
-    builder.add_node("assistant", call_model)
-    if tools:
-        builder.add_node("tools", ToolNode(tools))
-    builder.add_node("write_memory", write_memory)
-
-    # Define edges
-    builder.add_edge(START, "assistant")
-    if tools:
-        builder.add_conditional_edges("assistant", tools_condition)
-        builder.add_edge("tools", "assistant")
-    builder.add_edge("assistant", "write_memory")
-    builder.add_edge("write_memory", END)
-
-    # Compile graph with memory
-    memory = MemorySaver()
-    agent = builder.compile(checkpointer=memory)
-else:
-    agent = None
-
-# FastAPI endpoint
+# FastAPI endpoints
 @app.get("/chat/{user_id}/{query}")
 async def get_content(user_id: str, query: str):
     """Handles chat queries with user-specific memory."""
@@ -213,8 +277,8 @@ async def root():
     status = {
         "status": "running",
         "ai_service": "available" if llm else "unavailable - missing GOOGLE_API_KEY",
-        "vector_store": "available" if retriever else "unavailable",
-        "message": "Alexandra Hotel Virtual Assistant API is running"
+        "tavily_search": "available" if tavily_api_key else "unavailable",
+        "message": "Solar Panel Virtual Assistant API is running"
     }
     return status
 
